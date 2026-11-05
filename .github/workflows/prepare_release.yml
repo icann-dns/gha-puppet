@@ -1,5 +1,4 @@
 ---
-
 name: Prepare Release
 
 on:
@@ -15,32 +14,44 @@ on:
         default: ''
         type: string
       working-directory:
-        description: The working directory where all jobs should be executed. Used for modules in subdirectories like a monorepo or a control repository.
+        description: 'Working directory for the release'
         default: '.'
         required: false
         type: string
       base-branch:
-        description: 'The branch that will be used as the origin for the release branch.'
+        description: 'Branch used as the origin for the release branch'
         required: false
         default: ''
         type: string
       git_name:
-        description: 'name for the git committer and author'
+        description: 'Name for the git committer and author'
         required: false
         default: 'Release Automation'
         type: string
       git_email:
-        description: 'email for the git committer and author'
+        description: 'Email for the git committer and author'
         required: false
         default: "${{ github.repository_owner }}@users.noreply.github.com"
         type: string
+      app_client_id:
+        description: 'Optional GitHub App Client ID'
+        required: false
+        default: ''
+        type: string
+
     secrets:
       github_pat:
-        description: 'The pccibot PAT that will create the PR'
-        required: true
-      ssh_private_key:
-        description: 'multiline SSH private key from the bot account'
+        description: 'PAT used when App credentials are absent'
         required: false
+      app_private_key:
+        description: 'Optional GitHub App private key'
+        required: false
+      ssh_private_key:
+        description: 'Optional SSH private key for commit signing'
+        required: false
+
+permissions:
+  contents: read
 
 env:
   BUNDLE_WITHOUT: development:test:system_tests
@@ -54,59 +65,104 @@ env:
 
 jobs:
   prepare_release:
-    defaults:
-      run:
-        working-directory: ${{ inputs.working-directory }}
     name: 'Prepare Release'
     runs-on: ubuntu-24.04
     if: github.repository_owner == inputs.allowed_owner
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
     steps:
+      - name: Validate release authentication
+        id: auth
+        working-directory: .
+        shell: bash
+        env:
+          APP_CLIENT_ID: ${{ inputs.app_client_id }}
+          APP_PRIVATE_KEY: ${{ secrets.app_private_key }}
+          GITHUB_PAT: ${{ secrets.github_pat }}
+          SSH_PRIVATE_KEY: ${{ secrets.ssh_private_key }}
+        run: |
+          if [[ -n "$APP_CLIENT_ID" || -n "$APP_PRIVATE_KEY" ]]; then
+            if [[ -z "$APP_CLIENT_ID" || -z "$APP_PRIVATE_KEY" ]]; then
+              echo "::error::Both app_client_id and app_private_key are required"
+              exit 1
+            fi
+            echo "method=app" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$GITHUB_PAT" ]]; then
+            echo "method=pat" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Provide github_pat or GitHub App credentials"
+            exit 1
+          fi
+
+          if [[ -n "$SSH_PRIVATE_KEY" ]]; then
+            echo "has_ssh_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_ssh_key=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate GitHub App token
+        id: app_token
+        if: steps.auth.outputs.method == 'app'
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ inputs.app_client_id }}
+          private-key: ${{ secrets.app_private_key }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.base-branch }}
+          persist-credentials: false
+
       - name: Setup Ruby
         uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1.336.0
         with:
           ruby-version: '3.3'
           bundler-cache: true
           working-directory: ${{ inputs.working-directory }}
+
       - name: Display Ruby environment
         run: bundle env
+
       - name: Update metadata.json to new version
         run: |
-          if [[ -n $BLACKSMITH_FULL_VERSION ]] ; then
+          if [[ -n $BLACKSMITH_FULL_VERSION ]]; then
             bundle exec rake module:bump:full
           else
             bundle exec rake module:bump
           fi
+
       - name: Prepare the release
         env:
-          # https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication
-          CHANGELOG_GITHUB_TOKEN: '${{ secrets.github_pat }}'
+          CHANGELOG_GITHUB_TOKEN: ${{ steps.app_token.outputs.token || secrets.github_pat }}
         run: bundle exec rake release:prepare
-      - name: set git user & email & commit signing
+
+      - name: Set git user and email
         run: |
           git config --global user.email "$GIT_AUTHOR_EMAIL"
           git config --global user.name "$GIT_AUTHOR_NAME"
 
-      - name: Add SSH key
-        # hacky workaround because secrets aren't availble for if:
-        # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#example-using-secrets
-        # this is required to keep the secret optional
+      - name: Add SSH signing key
+        if: steps.auth.outputs.has_ssh_key == 'true'
         env:
-          super_secret: ${{ secrets.ssh_private_key }}
-        if: ${{ env.super_secret  != '' }}
+          SSH_PRIVATE_KEY: ${{ secrets.ssh_private_key }}
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.ssh_private_key }}" > ~/.ssh/github_actions
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/github_actions
           chmod 600 ~/.ssh/github_actions
-          ssh-agent -a $SSH_AUTH_SOCK > /dev/null
+          ssh-agent -a "$SSH_AUTH_SOCK" > /dev/null
           ssh-add ~/.ssh/github_actions
           git config --global gpg.format ssh
           git config --global user.signingkey ~/.ssh/github_actions
           git config --global commit.gpgsign true
-      - name: Create pull Request
+
+      - name: Create pull request
         id: cpr
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
@@ -115,7 +171,7 @@ jobs:
           delete-branch: true
           title: "Release ${{ inputs.version }}"
           labels: skip-changelog
-          token: '${{ secrets.github_pat }}'
+          token: ${{ steps.app_token.outputs.token || secrets.github_pat }}
           assignees: '${{ github.triggering_actor }}'
           author: '${{ env.GIT_AUTHOR_NAME }} <${{ env.GIT_AUTHOR_EMAIL }}>'
           committer: '${{ env.GIT_COMMITTER_NAME }} <${{ env.GIT_COMMITTER_EMAIL }}>'
@@ -131,3 +187,4 @@ jobs:
           PR_OPERATION: ${{ steps.cpr.outputs.pull-request-operation }}
         run: |
           echo "::notice::${PR_URL} was ${PR_OPERATION}."
+
